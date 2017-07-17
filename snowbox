@@ -1,0 +1,788 @@
+#!/usr/bin/perl
+#
+# Snowbox - a simple POP3 server written in Perl
+# Version 1.0.1
+#
+# Copyright 2004-2008 Oliver Feiler <kiza@kcore.de>
+# http://snowbox.kcore.de/
+#
+#############################################################################
+# This program is free software; you can redistribute it and/or modify      #
+# it under the terms of the GNU General Public License version 2 as         #
+# published by the Free Software Foundation.                                #
+#                                                                           #
+# This program is distributed in the hope that it will be useful,           #
+# but WITHOUT ANY WARRANTY; without even the implied warranty of            #
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the             #
+# GNU General Public License for more details.                              #
+#                                                                           #
+# You should have received a copy of the GNU General Public License         #
+# along with this program; if not, write to the Free Software               #
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA #
+#############################################################################
+
+use strict;
+use English;
+use Digest::MD5 qw(md5_hex);
+use Sys::Syslog qw(:DEFAULT setlogsock);
+use Fcntl':flock';
+use Fcntl;
+use Socket;
+use Time::HiRes qw( usleep );
+
+###
+# Default mail system configuration. Edit the config file
+# /etc/snowbox/config to reflect your local configuration.
+###
+my $snowbox_config = "/etc/snowbox/config";	### change this if neccessary ###
+my $passwordfile = "/etc/snowbox/user.auth";
+my $maildrops = "/var/mail/";
+my $maildrop_gid = "mail";
+#my $maildrop_format = "mbox";
+my $loglevel = 1;						# 0: none
+										# 1: failed logins
+										# 2: +all other failed commands
+										# 3: a lot
+config();
+
+###
+# Internal variables
+###
+my $logged_in = 0;						# Set to 1 after successful user login
+my $input;
+my $command;
+my $argument;
+my $argument2;
+my $user;
+my $pass;
+my $num_messages;
+my $maildrop_size;
+my $myhostname = `hostname`;
+chomp($myhostname);
+my $apop_stamp = "<$PID.".time()."\@$myhostname>";
+my @maildrop;
+my $maildrop_override;					# Configfile override
+my $maildrop_changed = 0;
+my $conn_timeout = 60;					# Connection times out after 1 Min of
+                                        # inactivity. Snowbox then exits.
+
+my $remote = "127.0.0.1";
+# Get IP of connected client
+# If we are not connected to a socket (run from cmd line) ignore the lookup
+if (getsockname(STDIN)) {
+	$remote = inet_ntoa((unpack_sockaddr_in(getpeername(STDIN)))[1]);
+}
+
+# Install signal handlers to clean up after sudden disconnect
+$SIG{'HUP'} = 'signal_handler';
+$SIG{'INT'} = 'signal_handler';
+$SIG{'PIPE'} = 'signal_handler';
+$SIG{'ALRM'} = 'signal_handler';		# This fires when $conn_timeout is reached
+
+$| = 1;									# make unbuffered
+openlog ('snowbox', 'pid', 'user');		# open the syslog facility
+setlogsock('unix');						# specify unix socket for logging?
+
+if ($loglevel >= 3) {
+	syslog('debug', "connection from $remote.");
+}
+
+###
+# server starts
+###
+print "+OK Hi, nice to meet you. POP3 server ready $apop_stamp\r\n";
+
+while (1) {
+	eval {
+		alarm($conn_timeout);
+		$input = <STDIN>;
+		alarm(0);
+	};
+	
+	
+	$input =~ tr/\r\n//d;	# Remove trailing \r\n
+
+	# Commands in the POP3 consist of a case-insensitive keyword, possibly
+	# followed by one or more arguments.
+	($command,$argument,$argument2) = split(/ /,$input);
+	
+	if (!defined($command)) {
+		pop_cmd_unknown();
+		next;
+	}
+	
+	# Check length of input. Command may be up to 4 char, arg up to 40
+	if ((length($command) > 4) ||
+		(length($argument) > 40) ||
+		(length($argument2) > 40)) {
+		pop_cmd_too_long();
+		next;
+	}
+	
+	$command =~ tr/a-z/A-Z/;	# Convert commands to uppercase
+	
+	# Recalc $num_messages and $maildrop_size
+	$num_messages = 0;
+	$maildrop_size = 0;
+	foreach (@maildrop) {
+		if (%$_->{"deleted"} == 0) {
+			$num_messages++;
+			$maildrop_size += %$_->{"len"};
+		}
+	}
+	
+	if ($command eq "USER") {
+		if (!defined($argument)) {
+			pop_cmd_unknown();
+			next;
+		}
+		# Don't allow switching of usernames once logged in.
+		if ($logged_in == 1) {
+			print "-ERR Already logged in.\r\n";
+			next;
+		}
+		if (defined($user)) {
+			print "-ERR User name already given.\r\n";
+			next;
+		}
+		$user = $argument;
+		$user =~ tr/a-zA-Z0-9\-\._+//cd;		# Sanitize user name
+
+		print "+OK May I have your password please?\r\n";
+	}
+	elsif ($command eq "PASS") {
+		if ($logged_in == 1) {
+			print "-ERR Already logged in.\r\n";
+			next;
+		}
+		$pass = $argument;
+		auth_user("PLAIN", $user, $pass);
+		
+		# authenticated
+		$logged_in = 1;
+		load_maildrop($user, "LOGIN");
+	}
+	elsif ($command eq "APOP") {
+		if ($logged_in == 1) {
+			print "-ERR Already logged in.\r\n";
+			next;
+		}
+		$user = $argument;
+		$pass = $argument2;
+		$user =~ tr/a-zA-Z0-9\-\._+//cd;		# Sanitize user name
+
+		auth_user("APOP", $user, $pass);
+		
+		# authenticated
+		$logged_in = 1;
+		load_maildrop($user, "LOGIN");
+	}
+	elsif ($command eq "AUTH") {
+		if ($logged_in == 1) {
+			print "-ERR Already logged in.\r\n";
+			next;
+		}
+		pop_cmd_auth();
+	}
+	elsif ($command eq "STAT") {
+		if (!$logged_in) {
+			pop_cmd_not_logged_in();
+			next;
+		}
+		pop_cmd_stat();
+	}
+	elsif ($command eq "LIST") {
+		if (!$logged_in) {
+			pop_cmd_not_logged_in();
+			next;
+		}
+		pop_cmd_list($argument);
+	}
+	elsif ($command eq "RETR") {
+		if (!$logged_in) {
+			pop_cmd_not_logged_in();
+			next;
+		}
+		pop_cmd_retr($argument);
+	}
+	elsif ($command eq "TOP") {
+		if (!$logged_in) {
+			pop_cmd_not_logged_in();
+			next;
+		}
+		pop_cmd_top($argument, $argument2);
+	}
+	elsif ($command eq "DELE") {
+		if (!$logged_in) {
+			pop_cmd_not_logged_in();
+			next;
+		}
+		pop_cmd_dele($argument);
+	}
+	elsif ($command eq "NOOP") {
+		pop_cmd_noop();
+	}
+	elsif ($command eq "RSET") {
+		if (!$logged_in) {
+			pop_cmd_not_logged_in();
+			next;
+		}
+		# this is very slow
+		@maildrop = ();
+		load_maildrop($user, "RSET");
+	}
+	elsif ($command eq "QUIT") {
+		pop_cmd_quit($logged_in);
+	}
+	elsif ($command eq "UIDL") {
+		if (!$logged_in) {
+			pop_cmd_not_logged_in();
+			next;
+		}
+		pop_cmd_uidl($argument);
+	}
+	elsif ($command eq "CAPA") {
+		pop_cmd_capa();
+	}
+	else {
+		pop_cmd_unknown($command);
+	}
+}
+
+sub auth_user {
+	my $sysuser;					# Username in passwordfile
+	my $syspass;					# Password in passwordfile
+	my $digest;
+	my $access_granted = 0;
+	my $uid;
+	my $gid;
+	my @pwdarray;
+	my $auth = shift;
+	my $user = shift;
+	my $pass = shift;
+	my $user_override;				# Configfile override
+
+	if (!open (AUTHFILE, "$passwordfile")) {
+		if ($loglevel >= 1) {
+			syslog('warning', "connection from $remote: could not open authorization file for reading.");
+		}
+		die "-ERR Internal error. Could not read authorization file.\r\n";
+	}
+	while (<AUTHFILE>) {
+		chomp;
+		if (/^#/) {
+			next;
+		}
+		
+		# Reset!
+		$sysuser = undef;
+		$syspass = undef;
+		$maildrop_override = undef;
+		$user_override = undef;
+		
+		/^([^\s]+)\s+([^\s]+)(\s+([^\s]+))?(\s+([^\s]+))?/;
+		$sysuser = $1;
+		$syspass = $2;
+		if (defined($4)) {
+			$maildrop_override = $4;
+		}
+		if (defined($6)) {
+			$user_override = $6;
+		}
+		if ($user eq $sysuser) {
+			if ($auth eq "APOP") {
+				$digest = md5_hex($apop_stamp.$syspass);
+				if ($pass eq $digest) {
+					$access_granted = 1;
+					last;
+				}
+			} elsif ($auth eq "PLAIN") {
+				if ($pass eq $syspass) {
+					$access_granted = 1;
+					last;
+				}
+			}
+		}
+	}
+	close (AUTHFILE);
+	
+	# Delay for some microseconds, since it might be possible to guess
+	# if a given user account exists with the above login code based
+	# on the time the server needs to answer the request.
+	my $random_sleep_usec = int(rand(100000));
+	if ($loglevel >= 3) {
+		syslog('debug', "delaying login for $random_sleep_usec usecs.");
+	}
+	usleep($random_sleep_usec);
+	
+	if (!$access_granted) {
+		print "-ERR Login incorrect.\r\n";
+		if ($loglevel >= 1) {
+			syslog('warning', "connection from $remote: failed login for \'$user\' using $auth.");
+		}
+		exit(1);
+	}
+	
+	if ($loglevel >= 3) {
+		syslog('debug', "connection from $remote: \'$user\' logged in successfully using $auth.");
+	}
+	
+	# Change to uid of logged user and gid of mail spool
+	@pwdarray = getgrnam($maildrop_gid);
+	$gid = $pwdarray[2];
+	if (defined($user_override)) {
+		@pwdarray = getpwnam($user_override);
+	} else {
+		@pwdarray = getpwnam($user);
+	}
+	$uid = $pwdarray[2];
+	
+	if (!defined($uid)) {
+		syslog('warning', "connection from $remote: Configuration error. Login user \'$user\' is not a valid user on the system and does not have a valid override! Please check the config!");
+		print "-ERR Configuration error. Login user is not valid and does not have a valid override. Check config!\r\n";
+		exit(2);
+	}
+	
+	$GID = $gid;
+	$EGID = "$gid $gid";
+	if ($loglevel >= 3) {
+		syslog('debug', "connection from $remote: changed gid to \'$EGID\'.");
+	}
+
+	$UID = $uid;
+	$EUID = $uid;
+	if ($EUID != $uid) {
+		syslog('warning', "connection from $remote: Internal error. Could not change uid to \'$uid\'. Not good.");
+		print "-ERR Internal error. setuid() failed. Not good.\r\n";
+		exit(2);
+	}
+	if ($loglevel >= 3) {
+		syslog('debug', "connection from $remote: changed uid to \'$EUID\'.");
+	}
+}
+
+sub load_maildrop {
+	my $user = shift;
+	my $state = shift;
+	my $line = "";
+	my $blankline = 1;				# First mesg is not preceded by a blank line
+	my $count = 1;
+	my $maildroppath = "$maildrops/$user";
+	
+	if (defined($maildrop_override)) {
+		$maildroppath = $maildrop_override;
+	}
+	
+	$num_messages = 0;
+	$maildrop_size = 0;
+	$maildrop_changed = 0;
+	
+	if (!open (MAILDROP, "+<$maildroppath"))  {
+		if ($loglevel >= 1) {
+			syslog('warning', "connection from $remote: mailbox \'$maildroppath\' for \'$user\' does not exist or is unreadable. Please check file permissions and configuration!");
+		}
+		die "-ERR Mailbox for this user does not exist.\r\n";
+	}
+	
+	if ($state eq "LOGIN") {
+		acquire_locks();
+	}
+	
+	while (<MAILDROP>) {
+		if ((/^From /) && ($blankline == 1)) {
+			$blankline = 0;
+			$num_messages++;
+			if ($line ne "") {
+				my %msghash;
+				
+				$maildrop_size += length($line);
+				
+				$msghash{"body"} = $line;
+				$msghash{"deleted"} = 0;
+				$msghash{"num"} = $count;
+				$msghash{"len"} = length($line);
+				my $uid;
+				$line =~ /\n(Message-ID: .*?)\n/i;
+				$uid = $1;
+				if (!$uid) {
+					$line =~ /^(From .*?)\n/i;
+					$uid = $1;
+				}
+				$msghash{"uid"} = $uid;
+				push(@maildrop, \%msghash);
+				$count++;
+			}
+			$line = "";
+		}
+		
+		$line = $line.$_;
+
+		if ($_ eq "\n") {
+			$blankline = 1;
+		} else {
+			$blankline = 0;
+		}
+	}
+	
+	if ($num_messages >= 1) {
+		my %msghash;
+
+		$maildrop_size += length($line);
+
+		$msghash{"body"} = $line;
+		$msghash{"deleted"} = 0;
+		$msghash{"num"} = $count;
+		$msghash{"len"} = length($line);
+		my $uid;
+		$line =~ /\n(Message-ID: .*?)\n/i;
+		$uid = $1;
+		if (!$uid) {
+			$line =~ /^(From .*?)\n/i;
+			$uid = $1;
+		}
+		$msghash{"uid"} = $uid;
+		push(@maildrop, \%msghash);
+	}
+	
+	print "+OK Welcome $user, you have $num_messages messages ($maildrop_size octets)\r\n";
+}
+
+###
+# POP3 commands
+###
+sub pop_cmd_auth {
+	print	"+OK I know the following authentication methods:\r\n".
+			"APOP\r\n".
+			".\r\n";
+}
+
+sub pop_cmd_capa {
+	print	"+OK Capability list follows\r\n".
+			"TOP\r\n".
+			"USER\r\n".
+			"UIDL\r\n".
+			"EXPIRE NEVER\r\n".
+			".\r\n";
+}
+
+sub pop_cmd_dele {
+	my $message = shift;
+	
+	$message =~ tr/0-9//cd;		# Must only contain 0-9
+	if (check_valid_msg_num($message) == -1) {
+		return;
+	}
+	
+	if ($message <= scalar(@maildrop)) {
+		if ($maildrop[$message-1]->{"deleted"} == 0) {
+			$maildrop[$message-1]->{"deleted"} = 1;
+			$maildrop_changed = 1;
+			print "+OK message $message deleted.\r\n";
+		} else {
+			print "-ERR message $message already deleted.\r\n";
+		}
+	} else {
+		print_err_no_such_msg();
+	}
+}                        
+
+sub pop_cmd_list {
+	my $message = shift;
+	
+	if (!defined($message)) {
+		print "+OK $num_messages messages ($maildrop_size octets)\r\n";
+		foreach (@maildrop) {
+			# Do not include deleted messages in listing
+			if (%$_->{"deleted"} == 0) {
+				print %$_->{"num"}." ".%$_->{"len"}."\r\n";
+			}
+		}
+		print ".\r\n";
+	} else {
+		$message =~ tr/0-9//cd;		# Must only contain 0-9
+		if (check_valid_msg_num($message) == -1) {
+			return;
+		}
+		
+		# Print -ERR for deleted messages
+		if (($message <= scalar(@maildrop)) && ($maildrop[$message-1]->{"deleted"} == 0)) {
+			print "+OK $message ".$maildrop[$message-1]->{"len"}."\r\n";
+		} else {
+			print_err_no_such_msg();
+		}
+	}
+}
+
+sub pop_cmd_noop {
+	print "+OK *sighs idly*\r\n";
+}
+
+sub pop_cmd_quit {
+	my $logged_in = shift;
+	
+	if ($logged_in) {
+		if ($maildrop_changed == 1) {
+			# Write maildrop
+			seek (MAILDROP, 0, 0);
+			truncate (MAILDROP, 0);
+			foreach (@maildrop) {
+				if (%$_->{"deleted"} == 0) {
+					print MAILDROP %$_->{"body"};
+				}
+			}
+		}
+		nuke_locks();
+	}
+	print "+OK POP3 server signing off. Have a nice day.\r\n";
+	
+	closelog();		# Close the syslog
+	exit(0);
+}
+
+sub pop_cmd_retr {
+	my $message = shift;
+	my $msg;
+	
+	if (!defined($message)) {
+		print_err_no_such_msg();
+		return;
+	}
+	$message =~ tr/0-9//cd;		# Must only contain 0-9
+	if (check_valid_msg_num($message) == -1) {
+		return;
+	}
+	
+	# Don't return deleted message
+	if ($message <= scalar(@maildrop)) {
+		if ($maildrop[$message-1]->{"deleted"} == 1) {
+			print "-ERR message was deleted.\r\n";
+			return;
+		}
+	}
+	
+	if ($message <= scalar(@maildrop)) {
+		print "+OK ".$maildrop[$message-1]->{"len"}." octets\r\n";
+		$msg = $maildrop[$message-1]->{"body"};
+		$msg =~ s/\n/\r\n/g;						# Replace all line endings with CRLF
+		$msg =~ s/\r\n\.(?=\r\n)/\r\n\.\./g;		# Prepad .CRLF -> ..CRLF
+		print $msg;
+		print ".\r\n";
+	} else {
+		print_err_no_such_msg();
+	}	
+}
+
+sub pop_cmd_stat {
+	print "+OK $num_messages $maildrop_size\r\n";
+}
+
+sub pop_cmd_top {
+	my $message = shift;
+	my $lines = shift;
+	my $msg;
+	
+	if (!defined($message)) {
+		print_err_no_such_msg();
+		return;
+	}
+	if (!defined($lines) || $lines eq '' || $lines < 0 ) {
+		pop_cmd_unknown();
+		return;
+	}
+
+	$message =~ tr/0-9//cd;		# Must only contain 0-9
+	if (check_valid_msg_num($message) == -1) {
+		return;
+	}
+	
+	# Don't return deleted message
+	if ($message <= scalar(@maildrop)) {
+		if ($maildrop[$message-1]->{"deleted"} == 1) {
+			print "-ERR message was deleted.\r\n";
+			return;
+		}
+	}
+	
+	if ($message <= scalar(@maildrop)) {
+		print "+OK\r\n";
+		$msg = $maildrop[$message-1]->{"body"};
+		my $foundnl = 0;
+
+		my @lines = split (/\n/, $msg, -1);
+                # Mail always ends by \n. Drop off last empty field
+		pop (@lines);
+
+		foreach my $line (@lines)
+		{
+			$line =~ s/^\.$/\.\./g;		# Prepad .CRLF -> ..CRLF
+
+			print "$line\r\n";
+
+			$foundnl |= ($line eq "");
+
+			last if ($foundnl && ($argument2-- <= 0))
+		}
+		print ".\r\n";
+	} else {
+		print_err_no_such_msg();
+	}	
+}
+
+sub pop_cmd_uidl {
+	my $message = shift;
+	
+	if (!defined($message)) {
+		print "+OK Just a second, UIDL listing follows.\r\n";
+		foreach (@maildrop) {
+			if (%$_->{"deleted"} == 0) {
+				print %$_->{"num"}." ".md5_hex(%$_->{"uid"})."\r\n";
+			}
+		}
+		print ".\r\n";
+	} else {
+		$message =~ tr/0-9//cd;		# Must only contain 0-9
+		if (check_valid_msg_num($message) == -1) {
+			return;
+		}
+		
+		if (($message <= scalar(@maildrop)) && ($maildrop[$message-1]->{"deleted"} == 0)) {
+			print "+OK ".$maildrop[$message-1]->{"num"}." ".md5_hex($maildrop[$message-1]->{"uid"})."\r\n";
+		} else {
+			print_err_no_such_msg();
+		}
+	}
+}
+
+sub pop_cmd_unknown {
+	my $command = shift;
+	
+	print "-ERR I have no idea what you want from me.\r\n";
+	if ($loglevel >= 3) {
+		syslog('debug', "connection from $remote: client does not speak proper POP3 (unknown command: $command).");
+	}
+}
+
+sub check_valid_msg_num {
+	my $message = shift;
+	
+	if (($message eq "") || ($message < 1)) {
+		print_err_no_such_msg();
+		return -1;
+	}
+	return 0;
+}
+
+sub pop_cmd_not_logged_in {
+	print "-ERR You are not logged in.\r\n";
+	if ($loglevel >= 2) {
+		syslog('info', "connection from $remote: client sent transaction command while not logged in.");
+	}
+}
+
+sub pop_cmd_too_long {
+	print "-ERR Command too long.\r\n";
+	if ($loglevel >= 1) {
+		syslog('warning', "connection from $remote: command sent was too long.");
+	}
+}
+
+sub print_err_no_such_msg {
+	print "-ERR No such message.\r\n";
+}
+
+sub acquire_locks {
+	my $mtime;
+	
+	# Lock the maildrop and exit if it is locked
+	if (!flock (MAILDROP, LOCK_EX | LOCK_NB)) {
+		if ($loglevel >= 1) {
+			syslog('warning', "connection from $remote: could not lock mailbox for \'$user\' (flock).");
+		}
+		die "-ERR Mailbox is locked. Is another POP3 session active?\r\n";
+	}
+	
+	my($dotlockfile);
+	if (defined($maildrop_override)) {
+		$dotlockfile = "$maildrop_override.lock";
+	} else {
+		$dotlockfile = "$maildrops/$user.lock";
+	}
+	
+	# see of there is a dotlock. try to delete it if older than 15 mins
+	if (-e"$dotlockfile") {
+		# Racey!
+		$mtime = (stat("$dotlockfile"))[9];
+		if (time()-$mtime > 900) {
+			if ($loglevel >= 1) {
+				syslog('warning', "connection from $remote: dotlock for \'$user\' is older than 15 min, ignoring.");
+			}
+			unlink ("$dotlockfile");
+		}
+	}
+	
+	# also set a dotlock here in case other programs ignore flock.
+	if (!sysopen (DOTLOCK, "$dotlockfile", O_CREAT | O_RDWR | O_EXCL)) {
+		if ($loglevel >= 1) {
+			syslog('warning', "connection from $remote: could not lock mailbox for \'$user\' (dotlock).");
+		}
+		die "-ERR Mailbox is locked. Is another POP3 session active?\r\n";
+	}
+	print DOTLOCK $PID;
+	close (DOTLOCK);
+}
+
+sub nuke_locks {
+	flock (MAILDROP, LOCK_UN);
+	
+	my($dotlockfile);
+	if (defined($maildrop_override)) {
+		$dotlockfile = "$maildrop_override.lock";
+	} else {
+		$dotlockfile = "$maildrops/$user.lock";
+	}
+	unlink ("$dotlockfile");
+	
+	close (MAILDROP);
+}
+
+sub signal_handler {
+	# Remove the locks if we get killed from inetd (SIGPIPE?)
+	if ($logged_in) {
+		nuke_locks();
+		if ($loglevel >= 2) {
+			syslog('info', "connection from $remote: connection aborted, removing locks.");
+		}
+	} else {
+		if ($loglevel >= 2) {
+			syslog('info', "connection from $remote: connection aborted.");
+		}
+	}
+	exit(2);
+}
+
+###
+# Load global configuration. If no config file exists the defaults
+# specified on top of the script are used.
+###
+sub config {
+	open (CONFIG, "$snowbox_config") || return;		# and use default config
+	while (<CONFIG>) {
+		chomp;
+		if (/^#/) {
+			next;
+		}
+		/^(.*?)\s+(.*)$/;
+		if ($1 eq "authfile") {
+			$passwordfile = $2;
+		} elsif ($1 eq "maildir") {
+			$maildrops = $2;
+		} elsif ($1 eq "maildir_gid") {
+			$maildrop_gid = $2;
+		} elsif ($1 eq "loglevel") {
+			$loglevel = $2;
+		#} elsif ($1 eq "maildrop_format") {
+		#	$maildrop_format = $2;
+		}
+	}
+	close (CONFIG);
+}

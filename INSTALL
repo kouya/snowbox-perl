@@ -1,0 +1,22 @@
+Prerequisites:
+
+Be sure that you have all the required Perl modules and an up-to-date
+Perl on your system. It was tested with Perl 5.6.1 and 5.8.0 as the time
+of this writing.
+
+None core modules used. You probably need to install these: Digest::MD5.
+(http://search.cpan.org/search?module=Digest::MD5)
+Modules used that are already bundled with Perl 5.6+: Sys::Syslog.
+(http://search.cpan.org/search?module=Sys::Syslog)
+
+Let's go:
+
+Run "make install" in the distribution directory. This will install the
+Snowbox executable in /usr/local/sbin and create an initial config
+directory /etc/snowbox. This directory will contain two files: "config",
+the global configuration file for snownews, and "user.auth" which contains
+the users allowed to connect to the server. These files will never be
+overwritten if they already exist.
+
+The configuration is pretty much self explanatory. See the manpage for
+more details about what can be done.

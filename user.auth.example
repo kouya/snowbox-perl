@@ -1,0 +1,10 @@
+user               password
+reallylongusername pwd
+
+anotheruser     with_this_password    /and/this/custom/mbox/path    login_user
+
+# Username and pwd	may be seperated by tabs and/or spaces.
+# And this is as you might have guessed a comment.
+#
+# Be sure to remove every example above before you actually put the server
+# online!

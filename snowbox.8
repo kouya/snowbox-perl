@@ -1,0 +1,131 @@
+.\" Snowbox manpage
+.\"
+.\" This manpage is copyrighted by Oliver Feiler 2004-2008
+.\"                                <kiza@kcore.de>
+.\"
+.TH SNOWBOX 8 "25 July 2008" "Snowbox 1.0"
+.SH NAME
+.B Snowbox
+\- a POP3 server
+.SH SYNPOSIS
+.B snowbox
+.SH DESCRIPTION
+Snowbox is a small and  secure POP3 server written in Perl. It runs exclusively
+from inetd. For a more complete list of features and further documentation
+see its webpage at http://snowbox.kcore.de/.
+.P
+For installation instructions please refer to the file INSTALL included
+with the distribution.
+.P
+.B Snowbox configuration
+.P
+The main configuration files are in /etc/snowbox. If Snowbox finds them there
+it reads the settings, otherwise it uses internal defaults.
+.P
+.B The main configuration file
+.br
+(/etc/snowbox/config)
+.P
+Editing of this file is not required. Default settings should be fine on a
+variety of systems. The following settings can be changed with this file.
+.P
+.B authfile:
+.br
+This is the location of the user authentication file. Snowbox  reads which
+users to let in and their passwords from this file. See the section below
+for a description of this file.
+.P
+.B maildir:
+.br
+This is the location of the system's mail spool directory. Usually this is
+/var/mail where your MTA dumps mails.
+.P
+.B maildir_gid:
+.br
+This is the group ID of the mail spool directory. The mail spool
+should be writable for this group as Snowbox changes to this GID and creates
+a .lock file here during the session.
+.P
+.B loglevel:
+.br
+For normal operation leave loglevel at default setting (1). Possible values
+are:
+.br
+0:    disable logging
+.br
+1:    default
+.br
+2:    unusual events usually only interesting for debugging
+.br
+3:    logs every connection and sent command. Aka "I want more noise in my syslog" mode.
+.P
+.B The user authentication file
+.br
+(/etc/snowbox/user.auth)
+.P
+This is the user authentication file. It should be owned by root and have
+strict file permissions. The default format is:
+.P
+username <blank space> password
+.P
+The blank space can be whitespaces or tabs and as much you need for cool
+looking ASCII art config files.
+.P
+.B Advanced configuration options
+.P
+Snowbox reads the users' mailboxes from the path you have configured in the
+config file + username. It is possible to override the location of the
+maildrop for each user. To do this, change the lines in the user.auth file
+so that it contains the following 4 fields:
+.P
+username
+.br
+password
+.br
+/path/to/maildrop_file
+.br
+system_username (optional)
+.P
+The system_username is the owner of the maildrop file on your system. If it is
+different from the login username you
+.B must
+specify it or snowbox will fail to change to that user ID.
+.P
+Examples:
+.P
+kiza    foobar    /home/kiza/mailbox
+.P
+Snowbox will login the user "kiza" with the password "foobar" and read
+mails from "/home/kiza/mailbox" for this user. (Instead of the default
+location)
+.P
+kiza2   foobar    /home/kiza/mailbox2    kiza
+.P
+Snowbox will login the user "kiza2" with the password "foobar", read the
+mails from "/home/kiza/mailbox2", but change to user "kiza" instead "kiza2"
+when opening the mailbox.
+.P
+.B Launching snowbox
+.P
+Snowbox runs from inetd. If you fear that someone might DoS your system
+by opening tons of connections to the POP3 port you need to tell your
+inetd to limit the maximum concurrent connections to the port.
+Put the following line into your /etc/inetd.conf:
+.P
+.B pop3	stream	tcp	nowait	root	/usr/local/sbin/snowbox	snowbox
+.P
+and restart inetd. If you're using xinetd or any other implementation you
+will need to figure out yourself how to get it running. ;) Feel free to
+mail me the config for inclusion in this manpage.
+.P
+That's it. If everything is ok you should be able to use the server now.
+.P
+Snowbox is released under the GNU General Public License version 2.
+.SH FILES
+/usr/local/sbin/snowbox
+.br
+/etc/snowbox/config
+.br
+/etc/snowbox/user.auth
+.SH AUTHOR
+Oliver Feiler <kiza@kcore.de>

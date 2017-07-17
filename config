@@ -1,0 +1,5 @@
+authfile		/etc/snowbox/user.auth
+maildir			/var/mail
+maildir_gid		mail
+loglevel		1
+#maildrop_format		mbox
