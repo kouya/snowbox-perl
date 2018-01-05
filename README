@@ -3,8 +3,8 @@ Snowbox is a POP3 server written in Perl.
 For installation instructions, please read the file INSTALL.
 For configuration and operation instructions, please see the manpage.
 
-Up-to-date information may, or may not ;), be found at the web page
-http://snowbox.kcore.de/.
+This version has been retired in favor of the rewrite in Go.
+https://github.com/kouya/snowbox
 
 Snowbox is released under the GNU General Public License version 2. See the
 file COPYING for details.
